@@ -1,0 +1,10 @@
+# Binaries / local
+/engine/continuum
+*.exe
+*.test
+.env
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
