@@ -25,4 +25,9 @@ type Linearizer interface {
 	GetRepoHead(ctx context.Context, repoID string) (types.RepoHead, error)
 	SetSnapshotSeq(ctx context.Context, repoID string, snapshotSeq uint64) error
 	SetSealedSeq(ctx context.Context, repoID string, sealedSeq uint64) error
+
+	// CommitPush serializes a repository push, validates every old OID, assigns
+	// its WAL sequence/hash, durably seals the WAL through seal, and atomically
+	// publishes all authoritative refs. The database commit is the commit point.
+	CommitPush(ctx context.Context, entry *types.WALEntry, seal func(*types.WALEntry) error) (types.PushResult, error)
 }

@@ -1,4 +1,4 @@
-# Continuum Layer-1 — Phase 0 local stack
+# Continuum Layer-1 — Phase 1 local stack
 # MinIO (S3) + Postgres (linearizer) + Valkey + continuum engine
 
 services:
@@ -39,7 +39,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ../engine/migrations/001_phase0.sql:/docker-entrypoint-initdb.d/001_phase0.sql:ro
+      - ../engine/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U continuum -d continuum"]
       interval: 3s

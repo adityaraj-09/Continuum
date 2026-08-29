@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -10,12 +11,17 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/adityaraj-09/Continuum/engine/internal/config"
+	"github.com/adityaraj-09/Continuum/engine/internal/gitserver"
 	"github.com/adityaraj-09/Continuum/engine/internal/linearizer"
+	pushservice "github.com/adityaraj-09/Continuum/engine/internal/push"
+	"github.com/adityaraj-09/Continuum/engine/internal/repository"
 	"github.com/adityaraj-09/Continuum/engine/internal/storage"
 	"github.com/adityaraj-09/Continuum/engine/internal/types"
 )
@@ -40,6 +46,28 @@ func main() {
 			log.Fatalf("migrate: %v", err)
 		}
 		fmt.Println("migrate: OK")
+	case "create":
+		if len(os.Args) != 3 {
+			log.Fatal("usage: continuum create <repo-id>")
+		}
+		if err := runCreate(os.Args[2]); err != nil {
+			log.Fatalf("create: %v", err)
+		}
+	case "materialize":
+		if len(os.Args) != 3 {
+			log.Fatal("usage: continuum materialize <repo-id>")
+		}
+		if err := runMaterialize(os.Args[2]); err != nil {
+			log.Fatalf("materialize: %v", err)
+		}
+	case "reference-transaction":
+		if len(os.Args) != 4 {
+			log.Fatal("usage: continuum reference-transaction <repo-id> <state>")
+		}
+		if err := runReferenceTransaction(os.Args[2], os.Args[3]); err != nil {
+			log.Printf("reference transaction rejected: %v", err)
+			os.Exit(1)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -53,6 +81,8 @@ Usage:
   continuum serve    Start health server + ensure backends
   continuum smoke    Prove MinIO put/get + Postgres per-ref CAS
   continuum migrate  Apply Phase 0 schema
+  continuum create <repo-id>
+  continuum materialize <repo-id>
 
 `)
 }
@@ -90,6 +120,118 @@ func runMigrate() error {
 	}
 	defer lin.Close()
 	return lin.Migrate(ctx)
+}
+
+func manager(cfg config.Config, store storage.Storage) (*repository.Manager, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	return &repository.Manager{DataDir: cfg.DataDir, HookBinary: executable, Store: store}, nil
+}
+
+func runCreate(repoID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cfg, err := load()
+	if err != nil {
+		return err
+	}
+	store, lin, err := openBackends(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer lin.Close()
+	if err := lin.Migrate(ctx); err != nil {
+		return err
+	}
+	if err := lin.EnsureRepo(ctx, repoID); err != nil {
+		return err
+	}
+	m, err := manager(cfg, store)
+	if err != nil {
+		return err
+	}
+	return m.Create(ctx, repoID)
+}
+
+func runMaterialize(repoID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	cfg, err := load()
+	if err != nil {
+		return err
+	}
+	store, lin, err := openBackends(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer lin.Close()
+	head, err := lin.GetRepoHead(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	m, err := manager(cfg, store)
+	if err != nil {
+		return err
+	}
+	return m.Materialize(ctx, repoID, head.CurrentSeq, head.LastWALHash)
+}
+
+func runReferenceTransaction(repoID, state string) error {
+	// "committed" and "aborted" are notifications. Durability and the
+	// authoritative Postgres transaction happen in "prepared".
+	if state != "prepared" {
+		return nil
+	}
+	var updates []types.RefUpdate
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) != 3 {
+			return fmt.Errorf("invalid reference transaction line %q", scanner.Text())
+		}
+		// Git may report the symbolic pseudo-ref HEAD when the first branch is
+		// created. Its target (refs/heads/main) is the durable mutation; replaying
+		// both would apply the same ref twice and detach HEAD.
+		if !strings.HasPrefix(fields[2], "refs/") {
+			continue
+		}
+		updates = append(updates, types.RefUpdate{Old: fields[0], New: fields[1], Ref: fields[2]})
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	cfg, err := load()
+	if err != nil {
+		return err
+	}
+	store, lin, err := openBackends(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer lin.Close()
+	if err := store.EnsureBucket(ctx); err != nil {
+		return err
+	}
+	coordinator := pushservice.Coordinator{Store: store, Linearizer: lin}
+	// On Git 2.39 the reference-transaction prepared hook runs after incoming
+	// objects have moved from quarantine into the repository ODB, but before
+	// refs are visible. Capture those validated packs. Existing packs may also
+	// be encountered; content-addressed S3 keys make them harmless/idempotent.
+	repoPath, pathErr := (&repository.Manager{DataDir: cfg.DataDir}).Path(repoID)
+	if pathErr != nil {
+		return pathErr
+	}
+	quarantinePath := filepath.Join(repoPath, "objects")
+	result, err := coordinator.Prepare(ctx, repoID, updates, quarantinePath)
+	if err != nil {
+		return err
+	}
+	log.Printf("push committed repo=%s push=%s seq=%d existing=%t", repoID, result.PushID, result.Seq, result.Existing)
+	return nil
 }
 
 func runServe() error {
@@ -145,7 +287,7 @@ func runServe() error {
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"ok":true,"node":%q,"phase":0}`, cfg.NodeID)
+		fmt.Fprintf(w, `{"ok":true,"node":%q,"phase":1}`, cfg.NodeID)
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -173,10 +315,53 @@ func runServe() error {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "ready")
 	})
+	mux.Handle("/git/", gitserver.Handler{ReposDir: filepath.Join(cfg.DataDir, "repos")})
+	mux.HandleFunc("/api/repos/", func(w http.ResponseWriter, r *http.Request) {
+		relative := strings.TrimPrefix(r.URL.Path, "/api/repos/")
+		repoID, action, _ := strings.Cut(relative, "/")
+		if err := repository.ValidateID(repoID); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		l, s, backendErr := lin, store, ready
+		mu.Unlock()
+		if backendErr != nil || l == nil || s == nil {
+			http.Error(w, "backends not ready", http.StatusServiceUnavailable)
+			return
+		}
+		m, err := manager(cfg, s)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		switch {
+		case r.Method == http.MethodPost && action == "":
+			if err := l.EnsureRepo(r.Context(), repoID); err == nil {
+				err = m.Create(r.Context(), repoID)
+			}
+		case r.Method == http.MethodDelete && action == "local":
+			err = m.DeleteLocal(repoID)
+		case r.Method == http.MethodPost && action == "materialize":
+			var head types.RepoHead
+			head, err = l.GetRepoHead(r.Context(), repoID)
+			if err == nil {
+				err = m.Materialize(r.Context(), repoID, head.CurrentSeq, head.LastWALHash)
+			}
+		default:
+			http.Error(w, "method or action not supported", http.StatusMethodNotAllowed)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: mux}
 	go func() {
-		log.Printf("continuum phase0 listening on %s (node=%s)", cfg.ListenAddr, cfg.NodeID)
+		log.Printf("continuum phase1 listening on %s (node=%s)", cfg.ListenAddr, cfg.NodeID)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("listen: %v", err)
 		}

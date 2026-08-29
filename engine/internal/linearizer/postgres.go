@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/adityaraj-09/Continuum/engine/internal/types"
+	"github.com/adityaraj-09/Continuum/engine/internal/wal"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -43,10 +45,15 @@ func (p *Postgres) Migrate(ctx context.Context) error {
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS repos (
     repo_id       TEXT PRIMARY KEY,
+    current_seq   BIGINT NOT NULL DEFAULT 0,
     snapshot_seq  BIGINT NOT NULL DEFAULT 0,
     sealed_seq    BIGINT NOT NULL DEFAULT 0,
+    last_wal_hash TEXT NOT NULL DEFAULT '',
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE repos ADD COLUMN IF NOT EXISTS current_seq BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE repos ADD COLUMN IF NOT EXISTS last_wal_hash TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS refs (
     repo_id    TEXT NOT NULL REFERENCES repos(repo_id) ON DELETE CASCADE,
@@ -58,6 +65,15 @@ CREATE TABLE IF NOT EXISTS refs (
 );
 
 CREATE INDEX IF NOT EXISTS refs_repo_idx ON refs(repo_id);
+
+CREATE TABLE IF NOT EXISTS pushes (
+    push_id     TEXT PRIMARY KEY,
+    repo_id     TEXT NOT NULL REFERENCES repos(repo_id) ON DELETE CASCADE,
+    seq         BIGINT NOT NULL,
+    entry_hash  TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (repo_id, seq)
+);
 `
 
 func (p *Postgres) EnsureRepo(ctx context.Context, repoID string) error {
@@ -184,8 +200,9 @@ func (p *Postgres) ensureRepoTx(ctx context.Context, tx pgx.Tx, repoID string) e
 func (p *Postgres) GetRepoHead(ctx context.Context, repoID string) (types.RepoHead, error) {
 	var h types.RepoHead
 	err := p.pool.QueryRow(ctx, `
-		SELECT repo_id, snapshot_seq, sealed_seq FROM repos WHERE repo_id=$1
-	`, repoID).Scan(&h.RepoID, &h.SnapshotSeq, &h.SealedSeq)
+		SELECT repo_id, current_seq, snapshot_seq, sealed_seq, last_wal_hash
+		FROM repos WHERE repo_id=$1
+	`, repoID).Scan(&h.RepoID, &h.CurrentSeq, &h.SnapshotSeq, &h.SealedSeq, &h.LastWALHash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return types.RepoHead{}, ErrNotFound
 	}
@@ -219,4 +236,131 @@ func (p *Postgres) SetSealedSeq(ctx context.Context, repoID string, sealedSeq ui
 		return ErrNotFound
 	}
 	return nil
+}
+
+// CommitPush implements the Phase-1 commit protocol. The repo row lock gives
+// the hash-chained WAL a total order. Individual refs still carry independent
+// versions and old-OID checks.
+func (p *Postgres) CommitPush(
+	ctx context.Context,
+	entry *types.WALEntry,
+	seal func(*types.WALEntry) error,
+) (types.PushResult, error) {
+	if entry.RepoID == "" || entry.PushID == "" || len(entry.RefUpdates) == 0 {
+		return types.PushResult{}, fmt.Errorf("invalid push: repo, push id, and ref updates are required")
+	}
+	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return types.PushResult{}, fmt.Errorf("begin push: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if err := p.ensureRepoTx(ctx, tx, entry.RepoID); err != nil {
+		return types.PushResult{}, err
+	}
+
+	var previous types.PushResult
+	err = tx.QueryRow(ctx, `
+		SELECT push_id, seq, entry_hash FROM pushes WHERE push_id=$1
+	`, entry.PushID).Scan(&previous.PushID, &previous.Seq, &previous.EntryHash)
+	if err == nil {
+		previous.Existing = true
+		return previous, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return types.PushResult{}, fmt.Errorf("check push id: %w", err)
+	}
+
+	var currentSeq uint64
+	var previousHash string
+	if err := tx.QueryRow(ctx, `
+		SELECT current_seq, last_wal_hash FROM repos WHERE repo_id=$1 FOR UPDATE
+	`, entry.RepoID).Scan(&currentSeq, &previousHash); err != nil {
+		return types.PushResult{}, fmt.Errorf("lock repo: %w", err)
+	}
+
+	seen := make(map[string]struct{}, len(entry.RefUpdates))
+	for _, update := range entry.RefUpdates {
+		if _, duplicate := seen[update.Ref]; duplicate {
+			return types.PushResult{}, fmt.Errorf("duplicate ref update %q", update.Ref)
+		}
+		seen[update.Ref] = struct{}{}
+
+		var currentOID string
+		err := tx.QueryRow(ctx, `
+			SELECT oid FROM refs WHERE repo_id=$1 AND ref=$2 FOR UPDATE
+		`, entry.RepoID, update.Ref).Scan(&currentOID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			if update.Old != types.ZeroOID {
+				return types.PushResult{}, ErrConflict
+			}
+			continue
+		}
+		if err != nil {
+			return types.PushResult{}, fmt.Errorf("lock ref %q: %w", update.Ref, err)
+		}
+		if currentOID != update.Old {
+			return types.PushResult{}, ErrConflict
+		}
+	}
+
+	entry.Schema = 1
+	entry.Seq = currentSeq + 1
+	entry.ParentSeq = currentSeq
+	entry.PrevHash = previousHash
+	if currentSeq == 0 {
+		entry.PrevHash = "genesis"
+	}
+	if entry.CreatedAt.IsZero() {
+		entry.CreatedAt = time.Now().UTC()
+	}
+	if _, err := wal.Finalize(entry); err != nil {
+		return types.PushResult{}, err
+	}
+
+	// External I/O deliberately occurs while the repo row is locked. This keeps
+	// WAL order simple and guarantees bytes exist before the DB commit point.
+	if err := seal(entry); err != nil {
+		return types.PushResult{}, fmt.Errorf("seal WAL: %w", err)
+	}
+
+	for _, update := range entry.RefUpdates {
+		if update.New == types.ZeroOID {
+			if _, err := tx.Exec(ctx, `
+				DELETE FROM refs WHERE repo_id=$1 AND ref=$2
+			`, entry.RepoID, update.Ref); err != nil {
+				return types.PushResult{}, fmt.Errorf("delete ref %q: %w", update.Ref, err)
+			}
+			continue
+		}
+		_, err := tx.Exec(ctx, `
+			INSERT INTO refs (repo_id, ref, oid, version)
+			VALUES ($1, $2, $3, 1)
+			ON CONFLICT (repo_id, ref) DO UPDATE
+			SET oid=EXCLUDED.oid, version=refs.version+1, updated_at=now()
+		`, entry.RepoID, update.Ref, update.New)
+		if err != nil {
+			return types.PushResult{}, fmt.Errorf("publish ref %q: %w", update.Ref, err)
+		}
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE repos
+		SET current_seq=$1, sealed_seq=$1, last_wal_hash=$2
+		WHERE repo_id=$3
+	`, entry.Seq, entry.EntryHash, entry.RepoID); err != nil {
+		return types.PushResult{}, fmt.Errorf("advance repo head: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO pushes (push_id, repo_id, seq, entry_hash)
+		VALUES ($1, $2, $3, $4)
+	`, entry.PushID, entry.RepoID, entry.Seq, entry.EntryHash); err != nil {
+		return types.PushResult{}, fmt.Errorf("record push: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return types.PushResult{}, fmt.Errorf("commit push: %w", err)
+	}
+	return types.PushResult{
+		PushID: entry.PushID, Seq: entry.Seq, EntryHash: entry.EntryHash,
+	}, nil
 }

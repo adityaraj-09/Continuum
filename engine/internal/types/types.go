@@ -43,6 +43,14 @@ type WALEntry struct {
 	EntryHash  string      `json:"entry_hash,omitempty"`
 }
 
+// PushResult is the durable result returned when a push is committed.
+type PushResult struct {
+	PushID    string
+	Seq       uint64
+	EntryHash string
+	Existing  bool
+}
+
 // RefState is the linearized current tip of one ref.
 type RefState struct {
 	RepoID  string
@@ -54,6 +62,8 @@ type RefState struct {
 // RepoHead is optional repo-level metadata (snapshot pointer, etc.).
 type RepoHead struct {
 	RepoID      string
+	CurrentSeq  uint64
 	SnapshotSeq uint64
 	SealedSeq   uint64
+	LastWALHash string
 }
