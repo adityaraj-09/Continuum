@@ -24,7 +24,7 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ ! -x ./trader || ! -x ./udp_send || ! -f ./xdp_filter.o ]]; then
-	echo "build first: make -C phase1" >&2
+	echo "build first: make" >&2
 	exit 1
 fi
 
