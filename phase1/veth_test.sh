@@ -53,7 +53,7 @@ ip netns exec "$NS_A" ip neigh replace "$IP_B" lladdr "$MAC_B" dev "$VETH_A"
 ip netns exec "$NS_B" ip neigh replace "$IP_A" lladdr "$MAC_A" dev "$VETH_B"
 
 QUEUES=1
-if command -v ethtool >/dev/null && ip netns exec "$NS_A" ethtool -L "$VETH_A" combined 2 >/dev/null; then
+if command -v ethtool >/dev/null && ip netns exec "$NS_A" ethtool -L "$VETH_A" combined 2 >/dev/null 2>&1; then
 	QUEUES=2
 fi
 
@@ -62,6 +62,7 @@ ip netns exec "$NS_A" ./trader \
 	--queues "$QUEUES" \
 	--cpu-base 0 \
 	--busy-poll \
+	--poll-ms 1 \
 	--stats-ms 0 \
 	"$VETH_A" >"$LOG" 2>&1 &
 TPID=$!
