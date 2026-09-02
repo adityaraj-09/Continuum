@@ -1,0 +1,3 @@
+*.o
+phase1/trader
+phase1/udp_send
