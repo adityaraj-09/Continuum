@@ -1,3 +1,6 @@
 *.o
 /trader
 /udp_send
+/md_send
+/order_recv
+/engine_test
