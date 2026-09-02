@@ -5,7 +5,7 @@ BPF_CFLAGS ?= -O2 -g -target bpf -D__TARGET_ARCH_x86 -Wall \
 	-I/usr/include/x86_64-linux-gnu
 
 CFLAGS	?= -O2 -g -Wall -Wextra
-LDFLAGS	?= -lxdp -lbpf -lelf -lz
+LDFLAGS	?= -lxdp -lbpf -lelf -lz -lpthread
 
 .PHONY: all clean test
 
