@@ -33,6 +33,8 @@
 #include <bpf/libbpf.h>
 #include <xdp/xsk.h>
 
+#include "engine.h"
+
 #ifndef SO_BUSY_POLL
 #define SO_BUSY_POLL 46
 #endif
@@ -53,6 +55,8 @@
 #define MARKET_DATA_PORT 9000
 #define HUGEPAGE_SIZE	(2UL * 1024 * 1024)
 #define MAX_QUEUES	64
+#define TX_FRAME_BEGIN	FILL_SIZE
+#define TX_FRAME_COUNT	(NUM_FRAMES - FILL_SIZE)
 
 struct cfg {
 	const char *ifname;
@@ -69,6 +73,7 @@ struct cfg {
 	int stats_ms;
 	int busy_us;
 	bool dump;
+	uint16_t order_port;
 };
 
 struct stats {
@@ -77,6 +82,16 @@ struct stats {
 	uint64_t empty;
 	uint64_t wakeup;
 	uint64_t bad;
+	uint64_t md_ok;
+	uint64_t md_bad;
+	uint64_t intents;
+	uint64_t tx;
+	uint64_t tx_done;
+};
+
+struct tx_pool {
+	uint64_t addrs[TX_FRAME_COUNT];
+	uint32_t nfree;
 };
 
 struct worker {
@@ -94,6 +109,15 @@ struct worker {
 	bool hugepage;
 	int xsk_fd;
 	struct stats stats;
+	struct book book;
+	struct reply_path path;
+	struct tx_pool tx_pool;
+	struct stamp st_parse;
+	struct stamp st_book;
+	struct stamp st_strat;
+	struct stamp st_tx;
+	uint32_t order_seq;
+	uint16_t ip_id;
 };
 
 struct app {
@@ -151,6 +175,7 @@ static void usage(const char *argv0)
 		"  --no-busy-poll      poll/sleep on idle RX\n"
 		"  --poll-ms N         idle poll timeout (default 0 if busy-poll else 1000)\n"
 		"  --stats-ms N        periodic counters (default 1000, 0 = signal/exit only)\n"
+		"  --order-port N      AF_XDP TX dest UDP port (default 9002)\n"
 		"  --dump              Phase 1 per-packet printf (debug only)\n",
 		argv0);
 }
@@ -166,6 +191,7 @@ static int parse_args(int argc, char **argv, struct cfg *c)
 	c->stats_ms = 1000;
 	c->busy_us = 20;
 	c->poll_ms = -1;
+	c->order_port = ORDER_PORT;
 
 	static const struct option opts[] = {
 		{"queues", required_argument, NULL, 'q'},
@@ -180,6 +206,7 @@ static int parse_args(int argc, char **argv, struct cfg *c)
 		{"no-busy-poll", no_argument, NULL, 'b'},
 		{"poll-ms", required_argument, NULL, 'p'},
 		{"stats-ms", required_argument, NULL, 's'},
+		{"order-port", required_argument, NULL, 'o'},
 		{"dump", no_argument, NULL, 'd'},
 		{0, 0, 0, 0},
 	};
@@ -224,6 +251,9 @@ static int parse_args(int argc, char **argv, struct cfg *c)
 			break;
 		case 's':
 			c->stats_ms = atoi(optarg);
+			break;
+		case 'o':
+			c->order_port = (uint16_t)atoi(optarg);
 			break;
 		case 'd':
 			c->dump = true;
@@ -310,55 +340,122 @@ static int pin_cpu(int cpu)
 	return 0;
 }
 
-static bool parse_ok(void *packet, uint32_t len, uint16_t *src, uint16_t *dst,
-		     uint32_t *payload_len)
+static void tx_pool_init(struct tx_pool *p)
 {
-	struct ethhdr *eth = packet;
-
-	if (len < sizeof(*eth))
-		return false;
-	if (ntohs(eth->h_proto) != ETH_P_IP)
-		return false;
-
-	struct iphdr *ip = (struct iphdr *)(eth + 1);
-
-	if ((uint8_t *)ip + sizeof(*ip) > (uint8_t *)packet + len)
-		return false;
-	if (ip->protocol != IPPROTO_UDP || ip->ihl < 5)
-		return false;
-
-	struct udphdr *udp =
-		(struct udphdr *)((uint8_t *)ip + ip->ihl * 4);
-
-	if ((uint8_t *)udp + sizeof(*udp) > (uint8_t *)packet + len)
-		return false;
-
-	uint8_t *payload = (uint8_t *)(udp + 1);
-	uint32_t header_len = (uint32_t)(payload - (uint8_t *)packet);
-
-	*src = ntohs(udp->source);
-	*dst = ntohs(udp->dest);
-	*payload_len = len > header_len ? len - header_len : 0;
-	return true;
+	p->nfree = TX_FRAME_COUNT;
+	for (uint32_t i = 0; i < TX_FRAME_COUNT; i++)
+		p->addrs[i] = (uint64_t)(TX_FRAME_BEGIN + i) * FRAME_SIZE;
 }
 
-static void count_packet(struct worker *w, void *packet, uint32_t len)
+static int tx_pool_get(struct tx_pool *p, uint64_t *addr)
 {
-	uint16_t src = 0, dst = 0;
-	uint32_t payload_len = 0;
+	if (!p->nfree)
+		return -1;
+	*addr = p->addrs[--p->nfree];
+	return 0;
+}
 
-	if (!parse_ok(packet, len, &src, &dst, &payload_len)) {
+static void tx_pool_put(struct tx_pool *p, uint64_t addr)
+{
+	if (p->nfree < TX_FRAME_COUNT)
+		p->addrs[p->nfree++] = addr;
+}
+
+static void kick_tx(struct worker *w)
+{
+	sendto(w->xsk_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+	w->stats.wakeup++;
+}
+
+static void reap_tx(struct worker *w)
+{
+	uint32_t idx;
+	uint32_t n = xsk_ring_cons__peek(&w->cq, RX_BATCH, &idx);
+
+	for (uint32_t i = 0; i < n; i++) {
+		uint64_t addr = *xsk_ring_cons__comp_addr(&w->cq, idx + i);
+
+		tx_pool_put(&w->tx_pool, addr);
+		w->stats.tx_done++;
+	}
+	if (n)
+		xsk_ring_cons__release(&w->cq, n);
+}
+
+static int tx_order(struct worker *w, const struct order_intent *in)
+{
+	uint64_t addr;
+	uint32_t idx;
+	uint8_t *frame;
+	int flen;
+
+	reap_tx(w);
+	if (tx_pool_get(&w->tx_pool, &addr))
+		return -1;
+
+	frame = xsk_umem__get_data(w->buffer, addr);
+	flen = order_frame_write(frame, FRAME_SIZE, &w->path,
+				 app.cfg.order_port, ++w->ip_id, in);
+	if (flen < 0) {
+		tx_pool_put(&w->tx_pool, addr);
+		return -1;
+	}
+
+	if (xsk_ring_prod__reserve(&w->tx, 1, &idx) != 1) {
+		tx_pool_put(&w->tx_pool, addr);
+		return -1;
+	}
+
+	xsk_ring_prod__tx_desc(&w->tx, idx)->addr = addr;
+	xsk_ring_prod__tx_desc(&w->tx, idx)->len = (uint32_t)flen;
+	xsk_ring_prod__submit(&w->tx, 1);
+	kick_tx(w);
+	return 0;
+}
+
+static void process_rx(struct worker *w, void *packet, uint32_t len)
+{
+	const uint8_t *payload;
+	uint32_t payload_len;
+	struct md_event ev;
+	struct order_intent intent;
+	uint64_t t0, t1;
+
+	t0 = nsec_now();
+	if (!udp_payload(packet, len, &payload, &payload_len)) {
 		w->stats.bad++;
 		return;
 	}
 
 	w->stats.packets++;
 	w->stats.bytes += len;
+	reply_path_from_rx(packet, len, &w->path);
 
-	if (app.cfg.dump) {
-		printf("packet: %u bytes  %u -> %u  payload=%u bytes\n",
-		       len, src, dst, payload_len);
-		fflush(stdout);
+	if (app.cfg.dump)
+		printf("packet: %u bytes payload=%u\n", len, payload_len);
+
+	if (!md_parse(payload, payload_len, &ev)) {
+		w->stats.md_bad++;
+		stamp_add(&w->st_parse, nsec_now() - t0);
+		return;
+	}
+	w->stats.md_ok++;
+	stamp_add(&w->st_parse, nsec_now() - t0);
+
+	t1 = nsec_now();
+	book_apply(&w->book, &ev);
+	stamp_add(&w->st_book, nsec_now() - t1);
+
+	t1 = nsec_now();
+	if (strategy_decide(&w->book, &w->order_seq, &intent)) {
+		w->stats.intents++;
+		stamp_add(&w->st_strat, nsec_now() - t1);
+		t1 = nsec_now();
+		if (tx_order(w, &intent) == 0)
+			w->stats.tx++;
+		stamp_add(&w->st_tx, nsec_now() - t1);
+	} else {
+		stamp_add(&w->st_strat, nsec_now() - t1);
 	}
 }
 
@@ -635,8 +732,10 @@ static void *rx_loop(void *arg)
 
 	while (!stop) {
 		uint32_t idx_rx;
-		uint32_t received =
-			xsk_ring_cons__peek(&w->rx, RX_BATCH, &idx_rx);
+		uint32_t received;
+
+		reap_tx(w);
+		received = xsk_ring_cons__peek(&w->rx, RX_BATCH, &idx_rx);
 
 		if (!received) {
 			w->stats.empty++;
@@ -655,7 +754,7 @@ static void *rx_loop(void *arg)
 			void *packet =
 				xsk_umem__get_data(w->buffer, desc->addr);
 
-			count_packet(w, packet, desc->len);
+			process_rx(w, packet, desc->len);
 			recycle[i] = desc->addr;
 		}
 
@@ -666,31 +765,92 @@ static void *rx_loop(void *arg)
 	return NULL;
 }
 
+static void print_stamp(const char *name, const struct stamp *s)
+{
+	if (!s->n) {
+		printf("latency %s n=0\n", name);
+		return;
+	}
+	printf("latency %s n=%" PRIu64 " min=%" PRIu64 " avg=%" PRIu64
+	       " max=%" PRIu64 " ns\n",
+	       name, s->n, s->min_ns, s->sum_ns / s->n, s->max_ns);
+}
+
 static void print_stats(const struct app *a)
 {
-	uint64_t packets = 0, bytes = 0, empty = 0, wakeup = 0, bad = 0;
-
 	for (uint32_t i = 0; i < a->cfg.nqueues; i++) {
 		const struct worker *w = &a->workers[i];
+		int32_t bid = 0, ask = 0;
+		uint32_t bid_sz = 0, ask_sz = 0;
+		int two = book_top(&w->book, &bid, &bid_sz, &ask, &ask_sz);
 
 		printf("stats q=%u cpu=%d packets=%" PRIu64 " bytes=%" PRIu64
 		       " empty=%" PRIu64 " wakeup=%" PRIu64 " bad=%" PRIu64
+		       " md_ok=%" PRIu64 " md_bad=%" PRIu64
+		       " intents=%" PRIu64 " tx=%" PRIu64 " tx_done=%" PRIu64
 		       "\n",
 		       w->queue, w->cpu, w->stats.packets, w->stats.bytes,
-		       w->stats.empty, w->stats.wakeup, w->stats.bad);
-		packets += w->stats.packets;
-		bytes += w->stats.bytes;
-		empty += w->stats.empty;
-		wakeup += w->stats.wakeup;
-		bad += w->stats.bad;
+		       w->stats.empty, w->stats.wakeup, w->stats.bad,
+		       w->stats.md_ok, w->stats.md_bad, w->stats.intents,
+		       w->stats.tx, w->stats.tx_done);
+		if (two)
+			printf("book q=%u inst=%u bid=%d x %u ask=%d x %u applies=%u\n",
+			       w->queue, w->book.instrument, bid, bid_sz, ask,
+			       ask_sz, w->book.applies);
+		else
+			printf("book q=%u inst=%u sides=%d/%d applies=%u\n",
+			       w->queue, w->book.instrument, w->book.bid.n,
+			       w->book.ask.n, w->book.applies);
+		print_stamp("parse", &w->st_parse);
+		print_stamp("book", &w->st_book);
+		print_stamp("strategy", &w->st_strat);
+		print_stamp("tx", &w->st_tx);
+	}
+	fflush(stdout);
+}
+
+static void print_locality(const char *ifname, int cpu)
+{
+	char path[256];
+	char if_numa[32] = "?";
+	char cpu_numa[32] = "?";
+	FILE *f;
+
+	snprintf(path, sizeof(path),
+		 "/sys/class/net/%s/device/numa_node", ifname);
+	f = fopen(path, "r");
+	if (f) {
+		if (fgets(if_numa, sizeof(if_numa), f))
+			if_numa[strcspn(if_numa, "\n")] = '\0';
+		fclose(f);
 	}
 
-	if (a->cfg.nqueues > 1)
-		printf("stats total packets=%" PRIu64 " bytes=%" PRIu64
-		       " empty=%" PRIu64 " wakeup=%" PRIu64 " bad=%" PRIu64
-		       "\n",
-		       packets, bytes, empty, wakeup, bad);
-	fflush(stdout);
+	if (cpu >= 0) {
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu%d/node", cpu);
+		/* fallback: node0/cpuN exists as a directory */
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu%d/topology/physical_package_id",
+			 cpu);
+		f = fopen(path, "r");
+		if (f) {
+			if (fgets(cpu_numa, sizeof(cpu_numa), f))
+				cpu_numa[strcspn(cpu_numa, "\n")] = '\0';
+			fclose(f);
+		}
+		for (int n = 0; n < 8; n++) {
+			snprintf(path, sizeof(path),
+				 "/sys/devices/system/node/node%d/cpu%d",
+				 n, cpu);
+			if (access(path, F_OK) == 0) {
+				snprintf(cpu_numa, sizeof(cpu_numa), "%d", n);
+				break;
+			}
+		}
+	}
+
+	printf("locality if=%s if_numa=%s cpu=%d cpu_numa=%s\n",
+	       ifname, if_numa, cpu, cpu_numa);
 }
 
 static void cleanup(struct app *a)
@@ -771,6 +931,8 @@ int main(int argc, char **argv)
 
 		w->queue = i;
 		w->cpu = app.cfg.cpu_base < 0 ? -1 : app.cfg.cpu_base + (int)i;
+		book_init(&w->book);
+		tx_pool_init(&w->tx_pool);
 		if (alloc_umem_area(w, try_huge, app.cfg.force_hugepage)) {
 			cleanup(&app);
 			return 1;
@@ -800,9 +962,10 @@ int main(int argc, char **argv)
 		}
 	}
 
-	printf("listening on %s queues=%u udp=%u xdp=%s bind=%s umem=%s busy_poll=%d\n",
+	print_locality(app.cfg.ifname, app.workers[0].cpu);
+	printf("listening on %s queues=%u udp=%u order=%u xdp=%s bind=%s umem=%s busy_poll=%d\n",
 	       app.cfg.ifname, app.cfg.nqueues, MARKET_DATA_PORT,
-	       app.xdp_note, app.bind_note, app.umem_note,
+	       app.cfg.order_port, app.xdp_note, app.bind_note, app.umem_note,
 	       app.cfg.busy_poll ? 1 : 0);
 	fflush(stdout);
 

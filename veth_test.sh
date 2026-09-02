@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Phases 2–4: counters only, pinned worker, explicit XDP/bind/UMEM mode.
-# UDP/9000 increments packets; UDP/9001 does not.
+# Full pipeline: filter, counters, pin, mode, parser, book, strategy, TX, latency.
 set -euo pipefail
 
 DIR=$(cd "$(dirname "$0")" && pwd)
@@ -18,17 +17,20 @@ cleanup() {
 		kill "$TPID" 2>/dev/null || true
 		wait "$TPID" 2>/dev/null || true
 	fi
+	if [[ -n "${OPID:-}" ]]; then
+		kill "$OPID" 2>/dev/null || true
+		wait "$OPID" 2>/dev/null || true
+	fi
 	ip netns del "$NS_A" 2>/dev/null || true
 	ip netns del "$NS_B" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-if [[ ! -x ./trader || ! -x ./udp_send || ! -f ./xdp_filter.o ]]; then
+if [[ ! -x ./trader || ! -x ./udp_send || ! -x ./md_send || ! -x ./order_recv || ! -f ./xdp_filter.o ]]; then
 	echo "build first: make" >&2
 	exit 1
 fi
 
-# Best-effort hugepages so Phase 4 can take the hugepage UMEM path.
 sysctl -w vm.nr_hugepages=8 >/dev/null 2>&1 || true
 
 ip netns del "$NS_A" 2>/dev/null || true
@@ -64,6 +66,7 @@ ip netns exec "$NS_A" ./trader \
 	--busy-poll \
 	--poll-ms 1 \
 	--stats-ms 0 \
+	--order-port 9002 \
 	"$VETH_A" >"$LOG" 2>&1 &
 TPID=$!
 
@@ -90,7 +93,6 @@ dump_stats() {
 	sleep 0.2
 }
 
-# Phase 2: wrong port must not increment the counter.
 ip netns exec "$NS_B" ./udp_send -n 3 "$IP_A" 9001 "phase-miss"
 sleep 0.3
 dump_stats
@@ -126,24 +128,59 @@ if ! grep -q 'pinned_cpu=0' "$LOG"; then
 	exit 1
 fi
 
-if ! grep -qE 'xdp=(native|skb)' "$LOG"; then
-	echo "FAIL: XDP mode not reported" >&2
+OLOG=$(mktemp)
+ip netns exec "$NS_B" ./order_recv -p 9002 -n 1 -t 3000 >"$OLOG" 2>&1 &
+OPID=$!
+for _ in $(seq 1 30); do
+	grep -q listening "$OLOG" && break
+	sleep 0.05
+done
+
+ip netns exec "$NS_B" ./md_send add bid "$IP_A" 9000 1 100 10
+ip netns exec "$NS_B" ./md_send add ask "$IP_A" 9000 1 103 10
+sleep 0.5
+dump_stats
+
+wait "$OPID" || true
+OPID=
+
+if ! grep -q 'book q=0 inst=1 bid=100 x 10 ask=103 x 10' "$LOG"; then
+	echo "FAIL: book did not reach 100/103" >&2
+	cat "$LOG" >&2
+	cat "$OLOG" >&2
+	exit 1
+fi
+
+intents=$(grep '^stats q=' "$LOG" | tail -1 | sed -n 's/.*intents=\([0-9]*\).*/\1/p')
+tx=$(grep '^stats q=' "$LOG" | tail -1 | sed -n 's/.* tx=\([0-9]*\).*/\1/p')
+if [[ "${intents:-0}" -lt 1 || "${tx:-0}" -lt 1 ]]; then
+	echo "FAIL: expected intent+TX, intents=$intents tx=$tx" >&2
+	cat "$LOG" >&2
+	cat "$OLOG" >&2
+	exit 1
+fi
+
+if ! grep -q 'order: BUY inst=1 px=101 sz=1' "$OLOG"; then
+	echo "FAIL: order not received on UDP/9002" >&2
+	cat "$OLOG" >&2
 	cat "$LOG" >&2
 	exit 1
 fi
 
-if ! grep -qE 'bind=(zerocopy|copy)' "$LOG"; then
-	echo "FAIL: bind mode not reported" >&2
+if ! grep -q 'latency parse' "$LOG" || ! grep -q 'latency tx' "$LOG"; then
+	echo "FAIL: missing Phase 9 latency lines" >&2
 	cat "$LOG" >&2
 	exit 1
 fi
 
-if ! grep -qE 'umem=(hugepage|heap)' "$LOG"; then
-	echo "FAIL: UMEM mode not reported" >&2
+if ! grep -q 'locality if=' "$LOG"; then
+	echo "FAIL: missing Phase 10 locality line" >&2
 	cat "$LOG" >&2
 	exit 1
 fi
 
 echo "---- trader log ----"
 cat "$LOG"
-echo "PASS: $hit_packets UDP/9000 counted, 9001 dropped, no hot-path printf, queues=$QUEUES"
+echo "---- order_recv ----"
+cat "$OLOG"
+echo "PASS: filter+book+BUY 101 TX+latency queues=$QUEUES"
