@@ -7,9 +7,9 @@ Attach only on a dedicated/test interface.
 
 ```text
 sudo apt-get install -y clang libbpf-dev libxdp-dev pkg-config iproute2 ethtool
-make -C phase1
-sudo make -C phase1 test
-sudo ./phase1/trader [options] <interface>
+make
+sudo make test
+sudo ./trader [options] <interface>
 ```
 
 `trader` always tries the fast path and **prints what it actually got**:
@@ -25,6 +25,6 @@ listening ... xdp=native|skb  bind=zerocopy|copy  umem=hugepage|heap  busy_poll=
 | 4 | Try native XDP, zero-copy, hugepage UMEM, `SO_BUSY_POLL`. Fall back and say so. |
 
 ```text
-./phase1/trader --queues 2 --cpu-base 4 --native --zerocopy --hugepage eth0
-./phase1/trader --skb --copy --no-hugepage --no-busy-poll veth0
+./trader --queues 2 --cpu-base 4 --native --zerocopy --hugepage eth0
+./trader --skb --copy --no-hugepage --no-busy-poll veth0
 ```
