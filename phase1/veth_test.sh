@@ -84,12 +84,12 @@ TPID=
 echo "---- trader log ----"
 cat "$LOG"
 
-if ! grep -qE '-> 9000' "$LOG"; then
+if ! grep -q -e '-> 9000' "$LOG"; then
 	echo "FAIL: UDP/9000 never reached userspace" >&2
 	exit 1
 fi
 
-if grep -qE '-> 9001' "$LOG"; then
+if grep -q -e '-> 9001' "$LOG"; then
 	echo "FAIL: UDP/9001 was forwarded to AF_XDP" >&2
 	exit 1
 fi

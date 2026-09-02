@@ -6,7 +6,7 @@ Unwanted packets are `XDP_DROP`. UDP dest **9000** is redirected to an AF_XDP
 socket on RX **queue 0** (SKB + copy so it runs on veth).
 
 ```text
-sudo apt-get install -y clang libbpf-dev libxdp-dev pkg-config
+sudo apt-get install -y clang libbpf-dev libxdp-dev pkg-config iproute2
 make -C phase1
 sudo make -C phase1 test          # veth pair: 9000 hits, 9001 drops
 sudo ./phase1/trader <interface>  # attach on a dedicated/test NIC
